@@ -1,231 +1,231 @@
-import requests
-from bs4 import BeautifulSoup
 import os
-import hashlib
 import json
+import hashlib
 from datetime import datetime
-import pytz
-from playwright.sync_api import sync_playwright
-import sys
-from io import BytesIO
-from PIL import Image
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-def exception_hook(exctype, value, traceback):
-    print(f"❌ Uncaught exception: {value}")
-    import traceback as tb
-    tb.print_exception(exctype, value, traceback)
-    sys.exit(1)
+import requests
 
-sys.excepthook = exception_hook
+from log_utils import log_to_buffer, send_log_to_channel
+from site_content import get_schedule_content, take_screenshot_between_elements
+from telegram_handler import send_notification
 
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
-TELEGRAM_LOG_CHANNEL_ID = os.environ.get('TELEGRAM_LOG_CHANNEL_ID')
+API_BASE_URL = os.getenv("API_BASE_URL")
 URL = os.environ.get('URL')
 SUBSCRIBE = os.environ.get('SUBSCRIBE')
 
-UKRAINE_TZ = pytz.timezone('Europe/Kyiv')
-log_messages = []
+QUEUES = [(i, j) for i in range(1, 7) for j in range(1, 2 + 1)]
 
-def get_ukraine_time():
-    return datetime.now(pytz.utc).astimezone(UKRAINE_TZ)
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 
-def log(message):
-    print(message)
-    ukraine_time = get_ukraine_time()
-    log_messages.append(f"{ukraine_time.strftime('%H:%M:%S')} - {message}")
+CURRENT_FILE = DATA_DIR / "current.json"
+HASH_FILE = DATA_DIR / "last_hash.json"
 
-def send_log_to_channel():
-    if not TELEGRAM_LOG_CHANNEL_ID or not log_messages:
-        return
+
+def fetch_schedule(cherga_id: int, pidcherga_id: int) -> Tuple[List[Dict], bool]:
+    """
+    Тягне графік для однієї черги.
+    Повертає (дані, is_error).
+    is_error=True означає, що була помилка (таймаут, 500 тощо).
+    is_error=False означає валідну відповідь (навіть якщо 0 записів).
+    """
+    resp: Optional[requests.Response] = None
     try:
-        ukraine_time = get_ukraine_time()
-        log_text = "📊 <b>SCRIPT EXECUTION LOG</b>\n\n"
-        log_text += "<pre>"
-        log_text += "\n".join(log_messages)
-        log_text += "</pre>"
-        log_text += f"\n\n⏰ Completed: {get_ukraine_time().strftime('%d.%m.%Y %H:%M:%S')} (Kyiv time)"
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            'chat_id': TELEGRAM_LOG_CHANNEL_ID,
-            'text': log_text,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(url, data=data, timeout=10)
-        if response.status_code == 200:
-            print("✅ Log sent to log channel")
+        params = {"cherga_id": cherga_id, "pidcherga_id": pidcherga_id}
+        resp = requests.get(API_BASE_URL, params=params, timeout=10)
+        resp.raise_for_status()
+
+        text = resp.text.strip()
+
+        if text.startswith("[") and text.endswith("]"):
+            data = json.loads(text)
         else:
-            print(f"❌ Error sending log: {response.text}")
+            if text.startswith("{"):
+                text = f"[{text}]"
+            data = json.loads(text)
+
+        if isinstance(data, list):
+            return data, False  # ← Валідна відповідь, без помилки
+
+        log_to_buffer(f"⚠️ Відповідь не список для {cherga_id}.{pidcherga_id}")
+        return [], False
+
     except Exception as e:
-        print(f"❌ Error sending log: {e}")
+        body = resp.text[:200] if resp is not None else ""
+        log_to_buffer(
+            f"❌ Помилка {cherga_id}.{pidcherga_id}: {e}. "
+            f"Фрагмент відповіді: {body}"
+        )
+        return [], True  # ← ПОМИЛКА! is_error=True
 
-def get_schedule_content():
+
+def fetch_all_schedules() -> Tuple[Dict[str, List[Dict]], Dict[str, bool]]:
+    """Повертає (дані, словник помилок)."""
+    all_schedules: Dict[str, List[Dict]] = {}
+    has_error: Dict[str, bool] = {}
+    log_to_buffer("📡 Завантажую графіки по всіх чергах...")
+
+    for cherga_id, pidcherga_id in QUEUES:
+        queue_key = f"{cherga_id}.{pidcherga_id}"
+        schedule, is_error = fetch_schedule(cherga_id, pidcherga_id)
+        all_schedules[queue_key] = schedule
+        has_error[queue_key] = is_error
+        error_note = " [помилка API]" if is_error else ""
+        log_to_buffer(f"  ✓ {queue_key}: {len(schedule)} записів{error_note}")
+
+    return all_schedules, has_error
+
+
+def save_json(data, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_json(path: Path):
+    if not path.exists():
+        return {}
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={'width': 1920, 'height': 3080})
-            page.goto(URL, wait_until='networkidle', timeout=30000)
-            page_content = page.content()
-            browser.close()
-            soup = BeautifulSoup(page_content, 'html.parser')
-            for br in soup.find_all('br'):
-                br.replace_with('\n')
-            important_message = None
-            update_date = None
-            for elem in soup.find_all(['div', 'span', 'p', 'h2', 'h3','h4','h5']):
-                text = elem.get_text(strip=False)
-                if 'УВАГА' in text and 'ІНФОРМАЦІЯ' in text and important_message is None:
-                    lines = [line.strip() for line in text.split('\n') if line.strip()]
-                    important_message = '\n'.join(lines)
-                    log(f"✅ Message found УВАГА: {important_message[:100]}...")
-                if 'Дата' in text and update_date is None:
-                    lines = [line.strip() for line in text.split('\n') if line.strip()]
-                    update_date = '\n'.join(lines)
-                    log(f"✅ Update date found: {update_date}")
-            if not important_message:
-                log("⚠️УВАГА message not found")
-            if not update_date:
-                log("⚠️ Update date not found")
-            return important_message, update_date
-    except Exception as e:
-        log(f"❌ Error Playwright: {e}")
-        return None, None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-def take_screenshot_between_elements():
-    try:
-        log("📸 I'm taking a screenshot of the gap between elements...")
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={'width': 1920, 'height': 3080})
-            page.goto(URL, wait_until='networkidle', timeout=30000)
-            date_element = page.locator("text=/Дата оновлення інформації/").first
-            end_element = page.locator("text=/робіт/").last
-            if date_element.count() == 0:
-                log("❌ Element 'Дата оновлення інформації' not found")
-                browser.close()
-                return None, None
-            if end_element.count() == 0:
-                log("⚠️ The word 'робіт' was not found, the entire page height will be used!")
-            date_box = date_element.bounding_box()
-            end_box = end_element.bounding_box() if end_element.count() > 0 else None
-            if not date_box:
-                log("❌ Failed to get coordinates 'Дата оновлення інформації'")
-                browser.close()
-                return None, None
-            x = 0
-            width = 1920
-            start_y = date_box['y'] + date_box['height']
-            full_screenshot = page.screenshot()
-            browser.close()
-            image = Image.open(BytesIO(full_screenshot))
-            if end_box:
-                end_y = end_box['y'] + end_box['height'] + 5
-                log(f"📐 Trimming to the word 'робіт': y={start_y}-{end_y}")
-            else:
-                end_y = image.height
-                log("📐 Crop to full page height (робіт no found)")
-            height = end_y - start_y
-            if height <= 0:
-                log("❌ Incorrect height of the screenshot area")
-                return None, None
-            cropped_image = image.crop((x, start_y, x + width, end_y))
-            cropped_image.save('screenshot.png')
-            screenshot_hash = hashlib.md5(cropped_image.tobytes()).hexdigest()
-            log(f"✅ Screenshot created. Hash: {screenshot_hash}")
-            return 'screenshot.png', screenshot_hash
-    except Exception as e:
-        log(f"❌ Screenshot creation error: {e}")
-        return None, None
 
-def get_last_data():
-    try:
-        with open('last_hash.json', 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data
-    except:
-        log("⚠️ last_hash.json not found (first run)")
-        return None
+def calculate_hash(obj) -> str:
+    json_str = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(json_str.encode("utf-8")).hexdigest()
 
-def save_data(message_content, date_content, screenshot_hash):
-    hash_message = hashlib.md5(message_content.encode('utf-8')).hexdigest() if message_content else None
-    with open('last_hash.json', 'w', encoding='utf-8') as f:
-        json.dump({
-            'hash_message': hash_message,
-            'content_message': message_content,
-            'content_date': date_content,
-            'screenshot_hash': screenshot_hash,
-            'timestamp': datetime.now().isoformat()
-        }, f, indent=2, ensure_ascii=False)
-    log(f"💾 Data saved. Message hash: {hash_message}, Хеш скріншота: {screenshot_hash}")
 
-def send_to_channel(message_content, date_content, screenshot_path=None):
-    try:
-        if screenshot_path and os.path.exists(screenshot_path):
-            photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-            full_message = f"🔔 UPDATES\n\n"
-            full_message += message_content
-            full_message += f'\n\n<a href="{URL}">🔗 View on the website </a>\n\n'
-            
-            if date_content:
-                full_message += f"{date_content}"
-            
-            if SUBSCRIBE:
-                full_message += f'\n\n<a href="{SUBSCRIBE}">⚡ SUBSCRIBE ⚡</a>'
-            else:
-                log("⚠️ SUBSCRIBE is not set in environment variables!")
-            
-            with open(screenshot_path, 'rb') as photo:
-                files = {'photo': photo}
-                data = {
-                    'chat_id': TELEGRAM_CHANNEL_ID,
-                    'caption': full_message,
-                    'parse_mode': 'HTML'
-                }
-                response = requests.post(photo_url, files=files, data=data, timeout=30)
-                if response.status_code == 200:
-                    log("✅ Message sent to the channel")
-                    return True
-                else:
-                    log(f"❌ Sending error: {response.text}")
-                    return False
-        else:
-            log("⚠️ Screenshot not found")
-            return False
-    except Exception as e:
-        log(f"❌ Sending error: {e}")
-        return False
+def extract_hashes(schedules: Dict[str, List[Dict]], has_error: Dict[str, bool]) -> Dict[str, str]:
+    """Витягує хеши для кожної черги, ігноруючи черги з помилками"""
+    hashes = {}
+    for queue_key, schedule in schedules.items():
+        # Зберігаємо хеш ТІЛЬКИ якщо немає помилки API
+        if not has_error.get(queue_key, False):
+            hashes[queue_key] = calculate_hash(schedule)
+    return hashes
+
+
+def load_last_hashes() -> Dict[str, str]:
+    hash_data = load_json(HASH_FILE)
+    return hash_data.get("queues", {})
+
+
+def save_hashes(hashes: Dict[str, str], timestamp: str) -> None:
+    hash_data = {
+        "timestamp": timestamp,
+        "queues": hashes,
+    }
+    save_json(hash_data, HASH_FILE)
+
+
+def get_changed_queues(
+    current_hashes: Dict[str, str], last_hashes: Dict[str, str]
+) -> List[str]:
+    """Порівнює поточні хеши з попередніми"""
+    changed = []
+    for queue_key, current_hash in current_hashes.items():
+        last_hash = last_hashes.get(queue_key)
+        if last_hash is None:
+            # Перший запуск для цієї черги
+            log_to_buffer(f"ℹ️ Перший запуск для {queue_key}")
+        elif current_hash != last_hash:
+            # Є зміни!
+            changed.append(queue_key)
+            log_to_buffer(f"🔄 Зміна в {queue_key}: {last_hash[:8]}... → {current_hash[:8]}...")
+    return changed
+
+
+def format_queues(queues: List[str]) -> str:
+    queues = sorted(queues)
+    if len(queues) == 1:
+        return f"черги {queues[0]}"
+    if len(queues) == 2:
+        return f"черг {queues[0]} та {queues[1]}"
+    return "черг " + ", ".join(queues)
+
 
 def main():
-    log("=" * 50)
-    log("🔍 MONITORING")
-    log("=" * 50)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_to_buffer("=" * 60)
+    log_to_buffer(f"🚀 СТАРТ [{timestamp}]")
+    log_to_buffer("=" * 60)
+
     try:
+        # 1. Завантажити графіки з API
+        current_schedules, has_error = fetch_all_schedules()
+        if not current_schedules:
+            log_to_buffer("❌ Не вдалось завантажити жоден графік")
+            return
+
+        # 2. Зберегти поточні графіки в data/current.json
+        save_json(current_schedules, CURRENT_FILE)
+        log_to_buffer("💾 Графіки збережено в data/current.json")
+
+        # 3. Витягти хеші поточних графіків (ігноруючи черги з помилками)
+        current_hashes = extract_hashes(current_schedules, has_error)
+        log_to_buffer(f"🔐 Витягнено хеші для {len(current_hashes)} черг")
+
+        # 4. Завантажити попередні хеші
+        last_hashes = load_last_hashes()
+        log_to_buffer(f"📋 Завантажено попередні хеші для {len(last_hashes)} черг")
+
+        # 5. Порівняти хеші і знайти змінені черги
+        changed_queues = get_changed_queues(current_hashes, last_hashes)
+
+        if not changed_queues:
+            log_to_buffer("✅ Дані по всіх чергах не змінилися")
+            # Все одно оновити timestamp
+            save_hashes(current_hashes, timestamp)
+            return
+
+        log_to_buffer(f"🔔 Зміни виявлено для: {', '.join(changed_queues)}")
+
+        # 6. Отримати текст і дату з сайту
         message_content, date_content = get_schedule_content()
         if not message_content:
-            log("❌ Failed to receive important message")
+            log_to_buffer("❌ Не вдалося отримати важливе повідомлення з сайту")
             return
+
+        # 7. Скріншот із сайту
         screenshot_path, screenshot_hash = take_screenshot_between_elements()
-        if not screenshot_path or not screenshot_hash:
-            log("❌ Failed to create a screenshot or get its hash")
-            return
-        last_data = get_last_data()
-        last_screenshot_hash = last_data.get('screenshot_hash') if last_data else None
-        log(f"🔑 Current screenshot hash: {screenshot_hash}")
-        log(f"🔑 Previous screenshot hash: {last_screenshot_hash}")
-        if last_screenshot_hash == screenshot_hash:
-            log("✅ There are no changes. Completion.")
-            save_data(message_content, date_content, screenshot_hash)
-            return
-        log("🔔 CHANGES IDENTIFIED!")
-        if send_to_channel(message_content, date_content, screenshot_path):
-            save_data(message_content, date_content, screenshot_hash)
-            log("✅ Successful! Update sent")
+        if not screenshot_path:
+            log_to_buffer("❌ Не вдалося створити скріншот")
+
+        # 8. Формування повідомлення для каналу
+        queues_str = format_queues(changed_queues)
+        final_message = (
+            f"Для {queues_str} 🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ\n\n"
+            f"{message_content}\n\n"
+            f'<a href="{URL}">🔗 Переглянути графік на сайті</a>\n\n'
+        )
+        if date_content:
+            final_message += f"{date_content}\n\n"
+        final_message += f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ ⚡️</a>'
+
+        # 9. Відправити в Telegram
+        from pathlib import Path as _Path
+
+        img_path = _Path(screenshot_path) if screenshot_path else None
+        ok = send_notification(final_message, img_path)
+        if ok:
+            log_to_buffer("✅ Повідомлення з оновленням відправлено в канал")
         else:
-            log("❌ Failed to send update")
+            log_to_buffer("❌ Помилка надсилання повідомлення в канал")
+
+        # 10. Оновити хеші в data/last_hash.json
+        save_hashes(current_hashes, timestamp)
+        log_to_buffer("💾 Хеші оновлено в data/last_hash.json")
+
     except Exception as e:
-        log(f"❌ Critical error: {e}")
+        log_to_buffer(f"❌ Критична помилка: {e}")
     finally:
         send_log_to_channel()
+        log_to_buffer("🏁 Завершення роботи скрипта")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
