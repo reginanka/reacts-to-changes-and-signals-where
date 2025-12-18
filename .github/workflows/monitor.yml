@@ -1,9 +1,9 @@
 name: Monitor Schedule Updates
 
 on:
-  # schedule:
+  schedule:
     # - cron: "*/5 * * * *"
-  # workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
   monitor:
