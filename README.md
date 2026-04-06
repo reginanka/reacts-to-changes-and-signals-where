@@ -160,6 +160,11 @@ The bot doesn't parse or explain what changed—it just tells you which queue to
 
 This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
 
+
+
+[![Rehina Nanaka profile views](https://u8views.com/api/v1/github/profiles/212413806/views/day-week-month-total-count.svg)](https://u8views.com/github/reginanka)
+
+
 ## Acknowledgments
 
 This project builds on the architecture of [sitemonitor-screen](https://github.com/reginanka/sitemonitor-screen), evolving it to leverage API data for granular per-queue monitoring while maintaining the visual confirmation approach that made the original version reliable.
